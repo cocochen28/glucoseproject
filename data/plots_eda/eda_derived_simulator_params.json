@@ -1,0 +1,57 @@
+{
+  "glucose": {
+    "observation_bounds": {
+      "min": 40.0,
+      "max": 400.0
+    },
+    "short_term_variability": {
+      "delta_std": 6.971529126495107,
+      "abs_delta_p95": 12.0
+    },
+    "safe_range_iqr": {
+      "low": 115.0,
+      "high": 202.0
+    },
+    "tail_thresholds": {
+      "hypoglycemia": 66.0,
+      "severe_hyperglycemia": 292.0
+    }
+  },
+  "meals": {
+    "typical_median_carbs": 36.0,
+    "common_range_iqr": {
+      "low": 20.0,
+      "high": 52.0
+    },
+    "upper_cap_p95": 129.49999999999932,
+    "avg_meals_per_day": 3.8127696701397653
+  },
+  "bolus": {
+    "typical_median_units": 4.8,
+    "common_range_iqr": {
+      "low": 2.8,
+      "high": 7.6
+    },
+    "upper_bound_p95": 12.5
+  },
+  "basal": {
+    "mean_rate_u_per_hr": 0.9783025830258304,
+    "typical_range_iqr": {
+      "low": 0.75,
+      "high": 1.2
+    },
+    "coefficient_of_variation": 0.26445025791249877,
+    "model_comment": "Basal modeled as constant background effect; low variance relative to bolus/meal supports this"
+  },
+  "validation": {
+    "finger_stick_min_max": {
+      "min": 31.0,
+      "max": 586.0
+    },
+    "cgm_min_max": {
+      "min": 40.0,
+      "max": 400.0
+    },
+    "note": "Finger-stick used only to confirm CGM min/max plausibility; not used to set parameters"
+  }
+}
