@@ -1,0 +1,8 @@
+Coeff 0.1 quick facts (eval means):
+- TIR: 45.62%
+- Mean glucose: 174.98 mg/dL
+- Hypo: 22.24 steps, 2.22 events
+- Severe hyper: 27.60 steps, 1.06 events
+- Total insulin: 941.55 U/day
+- Bolus insulin: 918.07 U/day
+- Action 4 (12.5U) mean count: 42.92 per episode
