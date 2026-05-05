@@ -32,6 +32,10 @@ from simulator_params import load_params, get_glucose_params
 TIME_IN_RANGE_LOW = 80.0
 TIME_IN_RANGE_HIGH = 180.0
 
+# Keep simple baselines from dosing every 5 minutes.
+# 24 steps * 5 minutes = 120 minutes refractory period.
+DEFAULT_BOLUS_COOLDOWN_STEPS = 24
+
 
 class BaselinePolicy:
     """Base class for insulin policies."""
@@ -57,6 +61,10 @@ class BaselinePolicy:
         """
         raise NotImplementedError
 
+    def reset_episode(self) -> None:
+        """Reset any episode-local policy state before a new rollout."""
+        return
+
 
 class NoInsulinPolicy(BaselinePolicy):
     """Never administer insulin."""
@@ -76,11 +84,21 @@ class SingleThresholdPolicy(BaselinePolicy):
         super().__init__(env, "single_threshold")
         glucose_cfg = get_glucose_params(params)
         self.high_threshold = glucose_cfg["safe_range_iqr"]["high"]  # IQR high
-        self.action_high = 3  # Action 3: high dose (IQR high of boluses)
+        self.action_high = 2  # Action 2: median dose
+        self.cooldown_steps = DEFAULT_BOLUS_COOLDOWN_STEPS
+        self.cooldown_remaining = 0
+
+    def reset_episode(self) -> None:
+        self.cooldown_remaining = 0
 
     def get_action(self, glucose: float) -> int:
-        """Return high bolus if glucose > threshold, else no bolus."""
+        """Return bolus if glucose > threshold and refractory period elapsed."""
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+            return 0
+
         if glucose > self.high_threshold:
+            self.cooldown_remaining = self.cooldown_steps
             return self.action_high
         return 0
 
@@ -93,14 +111,25 @@ class TwoThresholdPolicy(BaselinePolicy):
         glucose_cfg = get_glucose_params(params)
         self.severe_high_threshold = glucose_cfg["tail_thresholds"]["severe_hyperglycemia"]  # 97.5 pct
         self.high_threshold = glucose_cfg["safe_range_iqr"]["high"]  # IQR high
-        self.action_severe = 4  # Action 4: correction dose (p95)
+        self.action_severe = 3  # Action 3: correction dose
         self.action_high = 2  # Action 2: median dose
+        self.cooldown_steps = DEFAULT_BOLUS_COOLDOWN_STEPS
+        self.cooldown_remaining = 0
+
+    def reset_episode(self) -> None:
+        self.cooldown_remaining = 0
 
     def get_action(self, glucose: float) -> int:
-        """Return action based on two thresholds."""
+        """Return action based on thresholds with refractory cooldown."""
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+            return 0
+
         if glucose > self.severe_high_threshold:
+            self.cooldown_remaining = self.cooldown_steps
             return self.action_severe
         elif glucose > self.high_threshold:
+            self.cooldown_remaining = self.cooldown_steps
             return self.action_high
         return 0
 
@@ -134,6 +163,7 @@ def evaluate_baseline(
     for ep in range(n_episodes):
         ep_seed = seed + ep  # Different seed per episode for variety
         obs, _ = env.reset(seed=ep_seed)
+        policy.reset_episode()
         glucose = obs[0]
 
         # Per-episode tracking

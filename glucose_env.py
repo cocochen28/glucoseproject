@@ -6,6 +6,13 @@ Reward: penalizes hypoglycemia, hyperglycemia, and large insulin doses.
 
 All parameters loaded from simulator_params.py (EDA-derived, no hard-coded constants).
 
+TEMPORAL DYNAMICS (v2.0):
+  Realistic absorption curves replace instant impulses:
+  - Meals: glucose rise distributed uniformly over 24 steps (2 hours)
+  - Insulin: glucose drop distributed triangularly over 36 steps (peak effect at ~1 hour)
+  - Basal: continuous effect per step (unchanged)
+  - Noise: stochastic per step (unchanged)
+
 Metrics tracked per step in info dict:
   - hypo_step: 1 if glucose < 66 mg/dL this step, else 0
   - hypo_event: 1 if we just ENTERED hypo zone, else 0
@@ -38,6 +45,21 @@ class GlucoseEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
+    # Reward targets are aligned with reported TIR metric (80-180 mg/dL).
+    TIR_LOW = 80.0
+    TIR_HIGH = 180.0
+
+    # Zone reward magnitudes.
+    REWARD_IN_RANGE = 1.0
+    PENALTY_LOW = -5.0
+    PENALTY_HYPO = -20.0
+    PENALTY_HIGH = -2.0
+    PENALTY_SEVERE_HYPER = -10.0
+
+    # Temporal dynamics: absorption horizons (in steps of 5 minutes)
+    MEAL_ABSORPTION_STEPS = 24  # 2 hours: glucose rise spreads over this many steps
+    INSULIN_ABSORPTION_STEPS = 36  # 3 hours: bolus effect spreads over this many steps
+
     def __init__(
         self,
         params_json_path: str | None = None,
@@ -66,6 +88,12 @@ class GlucoseEnv(gym.Env):
         self.steps_since_last_bolus = 0
         self.was_in_hypo = False
         self.was_in_severe_hyper = False
+
+        # Temporal dynamics: absorption queues
+        # pending_meal_glucose: list of glucose contributions to apply over next steps (uniform distribution)
+        # pending_bolus_units: list of insulin units to apply over next steps (triangular distribution)
+        self.pending_meal_glucose = []
+        self.pending_bolus_units = []
 
     def _extract_params(self) -> None:
         """Unpack parameters from EDA JSON."""
@@ -146,14 +174,67 @@ class GlucoseEnv(gym.Env):
         self.was_in_hypo = False
         self.was_in_severe_hyper = False
 
+        # Clear absorption queues
+        self.pending_meal_glucose = []
+        self.pending_bolus_units = []
+
         if self.verbose:
             print(f"[reset] glucose={self.glucose:.1f} mg/dL")
 
         obs = self._get_observation()
         return obs, {}
 
+    def _create_meal_absorption_profile(self, total_meal_glucose: float) -> list:
+        """Create uniform meal absorption over MEAL_ABSORPTION_STEPS.
+        
+        Returns list of glucose increments, one per step.
+        Example: total_meal_glucose=12, MEAL_ABSORPTION_STEPS=24 -> [0.5, 0.5, ..., 0.5] (24x)
+        """
+        if self.MEAL_ABSORPTION_STEPS <= 0:
+            return []
+        increment_per_step = total_meal_glucose / self.MEAL_ABSORPTION_STEPS
+        return [increment_per_step] * self.MEAL_ABSORPTION_STEPS
+
+    def _create_insulin_absorption_profile(self, bolus_units: float) -> list:
+        """Create triangular insulin absorption over INSULIN_ABSORPTION_STEPS.
+        
+        Peak effect at step INSULIN_ABSORPTION_STEPS // 2 (1 hour of 3-hour window).
+        Returns list of insulin units to apply, one per step.
+        Example: triangular peak in middle, sum equals bolus_units.
+        """
+        if self.INSULIN_ABSORPTION_STEPS <= 0:
+            return []
+        
+        # Triangular profile: rises to peak at midpoint, then falls
+        n_steps = self.INSULIN_ABSORPTION_STEPS
+        peak_idx = n_steps // 2
+        profile = []
+        
+        # Ascending to peak
+        for i in range(peak_idx):
+            # Linear rise: 0 to 1 as i goes 0 to peak_idx
+            profile.append((i + 1) / (peak_idx + 1))
+        
+        # Descending from peak
+        for i in range(peak_idx, n_steps):
+            # Linear fall: 1 down to near 0
+            profile.append((n_steps - i) / (n_steps - peak_idx))
+        
+        # Normalize so sum equals bolus_units
+        profile_sum = sum(profile)
+        if profile_sum > 0:
+            profile = [u * bolus_units / profile_sum for u in profile]
+        
+        return profile
+
+    def _consume_absorption_queue(self, queue: list) -> float:
+        """Pop the first element from absorption queue and return it. Returns 0 if empty."""
+        if len(queue) > 0:
+            return queue.pop(0)
+        return 0.0
+
     def step(self, action: int) -> tuple:
-        """Take one step (5 minutes)."""
+        """Take one step (5 minutes) with realistic absorption dynamics."""
         if not self.action_space.contains(action):
             raise ValueError(f"Invalid action: {action}")
 
@@ -171,17 +252,40 @@ class GlucoseEnv(gym.Env):
         else:
             self.steps_since_last_bolus += 1
 
-        # --- Glucose dynamics ---
-        basal_effect = -self.basal_rate * (self.dt_minutes / 60.0)
-        insulin_sensitivity = 1.5  # mg/dL per unit
-        bolus_effect = -bolus_dose * insulin_sensitivity * (self.dt_minutes / 300.0)
+        # --- Glucose dynamics with temporal absorption ---
         
-        # Stochastic meal
-        meal_effect = 0.0
+        # Basal effect (continuous per step, no queuing)
+        basal_effect = -self.basal_rate * (self.dt_minutes / 60.0)
+        
+        # Insulin sensitivity: peak effect is ~1.5 mg/dL per unit absorbed
+        insulin_sensitivity = 1.5
+        
+        # Bolus: queue the insulin units for gradual absorption
+        bolus_effect = 0.0  # Will be updated from absorption queue
+        if bolus_dose > 0:
+            # Create absorption profile for this bolus
+            absorption_profile = self._create_insulin_absorption_profile(bolus_dose)
+            self.pending_bolus_units.extend(absorption_profile)
+        
+        # Consume one step of queued insulin.
+        # `insulin_units_this_step` is already a per-step absorbed amount from the IOB profile,
+        # so do not apply an additional dt scaling factor here.
+        insulin_units_this_step = self._consume_absorption_queue(self.pending_bolus_units)
+        bolus_effect = -insulin_units_this_step * insulin_sensitivity
+        
+        # Meal: queue the meal glucose for gradual absorption
+        meal_effect = 0.0  # Will be updated from absorption queue
         if self.stochastic_meals and self.rng.rand() < self.meal_prob_per_step:
             meal_carbs = self.rng.uniform(self.meal_min_carbs, self.meal_max_carbs)
-            meal_effect = meal_carbs * 0.5
-
+            total_meal_glucose = meal_carbs * 0.5
+            # Create absorption profile for this meal
+            absorption_profile = self._create_meal_absorption_profile(total_meal_glucose)
+            self.pending_meal_glucose.extend(absorption_profile)
+        
+        # Consume one step of queued meal glucose
+        meal_effect = self._consume_absorption_queue(self.pending_meal_glucose)
+        
+        # Stochastic noise
         noise = self.rng.normal(0, self.glucose_delta_std)
 
         # Update glucose
@@ -190,16 +294,16 @@ class GlucoseEnv(gym.Env):
 
         # --- Reward components ---
         zone_reward = 0.0
-        if self.glucose_safe_low <= self.glucose <= self.glucose_safe_high:
-            zone_reward += 1.0
-        if self.glucose < self.glucose_hypo:
-            zone_reward -= 20.0
-        elif self.glucose < self.glucose_safe_low:
-            zone_reward -= 5.0
-        if self.glucose > self.glucose_severe_hyper:
-            zone_reward -= 10.0
-        elif self.glucose > self.glucose_safe_high:
-            zone_reward -= 1.0
+        if self.TIR_LOW <= self.glucose <= self.TIR_HIGH:
+            zone_reward += self.REWARD_IN_RANGE
+        elif self.glucose < self.glucose_hypo:
+            zone_reward += self.PENALTY_HYPO
+        elif self.glucose < self.TIR_LOW:
+            zone_reward += self.PENALTY_LOW
+        elif self.glucose > self.glucose_severe_hyper:
+            zone_reward += self.PENALTY_SEVERE_HYPER
+        else:  # TIR_HIGH < glucose <= severe_hyper
+            zone_reward += self.PENALTY_HIGH
 
         # Configurable insulin penalty for reward sweeps.
         insulin_penalty = -self.insulin_penalty_coeff * bolus_dose
@@ -231,13 +335,16 @@ class GlucoseEnv(gym.Env):
             "hypo_event": hypo_event,  # 1 if just entered hypo zone
             "severe_hyper_step": int(now_in_severe_hyper),  # 1 if in severe hyper zone now
             "severe_hyper_event": severe_hyper_event,  # 1 if just entered severe hyper zone
+            "pending_meal_glucose": len(self.pending_meal_glucose),
+            "pending_bolus_units": len(self.pending_bolus_units),
         }
 
         if self.verbose and (self.step_count % 48 == 0 or terminated):
-            print(f"[step {self.step_count:3d}] glucose={self.glucose:6.1f} | bolus={bolus_dose:4.1f}U | reward={reward:+.2f}")
+            print(f"[step {self.step_count:3d}] glucose={self.glucose:6.1f} | bolus={bolus_dose:4.1f}U | pending_meal={len(self.pending_meal_glucose)} | pending_bolus={len(self.pending_bolus_units)} | reward={reward:+.2f}")
 
         obs = self._get_observation()
         return obs, reward, terminated, truncated, info
+
 
     def render(self, mode: str = "human") -> None:
         pass

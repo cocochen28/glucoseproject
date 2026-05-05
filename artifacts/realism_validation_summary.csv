@@ -1,0 +1,5 @@
+check,passed,details
+plausible_daily_insulin_totals,1,"expected~41.8 U/day, plausible band [16.7, 83.6] U/day; no_insulin: 0.0 U/day (informational baseline); random_policy: 1606.4 U/day (informational baseline); single_threshold: 21.2 U/day -> PASS; two_threshold: 22.6 U/day -> PASS"
+plausible_meal_response_peak,1,"meal=36.0g, peak_delta=16.0 mg/dL, t_peak=120 min -> magnitude PASS, timing PASS"
+plausible_extreme_zone_time,1,"cap=20.0% for hypo and severe-hyper occupancy; no_insulin: hypo=5.7%, severe=7.6% -> PASS; random_policy: hypo=13.5%, severe=1.6% -> PASS; single_threshold: hypo=5.9%, severe=4.6% -> PASS; two_threshold: hypo=5.9%, severe=4.2% -> PASS"
+no_instant_meal_spike_or_cancellation,1,"first_meal=0.750 mg/dL (4.2% of total), first_bolus=-0.053 mg/dL, cancellation_ratio=0.071 -> meal_spike PASS, cancellation PASS"

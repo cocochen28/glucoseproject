@@ -433,6 +433,10 @@ def train(
     eval_episodes: int = 5,
     output_csv: str = "artifacts/dqn_training.csv",
     insulin_penalty_coeff: float = 0.1,
+    early_stop_patience: int | None = None,
+    early_stop_min_evals: int = 4,
+    safety_hypo_max: float = 3.0,
+    safety_severe_max: float = 2.0,
     verbose: bool = False,
     save_models: bool = True,
 ):
@@ -463,9 +467,30 @@ def train(
     print(f"  Insulin penalty coeff: {insulin_penalty_coeff}")
     print(f"  Episodes: {episodes}")
     print(f"  Evaluation every {eval_freq} episodes ({eval_episodes} each)")
+    if early_stop_patience is not None:
+        print(
+            f"  Early stopping: patience={early_stop_patience}, "
+            f"min_evals={early_stop_min_evals}, "
+            f"safety(hypo<={safety_hypo_max}, severe<={safety_severe_max})"
+        )
     print()
     
     csv_rows = []
+
+    # Best-checkpoint tracking with safety-aware ranking.
+    # Rank format: (safety_feasible, tir, reward)
+    best_rank = (-1.0, -np.inf, -np.inf)
+    best_train_episode = -1
+    eval_rounds = 0
+    no_improve_rounds = 0
+
+    if output_csv:
+        out_stem = os.path.splitext(os.path.basename(output_csv))[0]
+    else:
+        out_stem = f"dqn_coeff_{insulin_penalty_coeff:.2f}"
+    best_model_path = os.path.join("artifacts", f"{out_stem}_best.pth")
+
+    stop_training = False
     
     for episode in range(episodes):
         state, _ = env.reset()
@@ -540,6 +565,7 @@ def train(
         # Evaluation
         if (episode + 1) % eval_freq == 0:
             eval_agg, eval_episodes_detail = evaluate_agent(agent, num_episodes=eval_episodes)
+            eval_rounds += 1
             
             for eval_ep, metrics in enumerate(eval_episodes_detail):
                 row = {
@@ -560,6 +586,46 @@ def train(
                     f"[Episode {episode+1:4d}] eps={agent.get_epsilon(episode):.3f} | "
                     f"Eval TIR={tir:5.1f}% | Insulin={insulin:6.0f}U | Reward={reward:7.0f}"
                 )
+
+            # Safety-aware best model selection.
+            current_tir = eval_agg["time_in_range_percent"]["mean"]
+            current_reward = eval_agg["total_reward"]["mean"]
+            current_hypo = eval_agg["hypo_events"]["mean"]
+            current_severe = eval_agg["severe_hyper_events"]["mean"]
+            safety_feasible = float(
+                (current_hypo <= safety_hypo_max) and (current_severe <= safety_severe_max)
+            )
+            current_rank = (safety_feasible, current_tir, current_reward)
+
+            if current_rank > best_rank:
+                best_rank = current_rank
+                best_train_episode = episode
+                no_improve_rounds = 0
+                if save_models:
+                    os.makedirs("artifacts", exist_ok=True)
+                    torch.save(agent.q_net.state_dict(), best_model_path)
+                    print(
+                        f"  New best checkpoint @ ep {episode+1}: "
+                        f"TIR={current_tir:.2f}, reward={current_reward:.1f}, "
+                        f"hypo={current_hypo:.2f}, severe={current_severe:.2f}"
+                    )
+            else:
+                no_improve_rounds += 1
+
+            # Early stopping on no improvement in best-rank objective.
+            if (
+                early_stop_patience is not None
+                and eval_rounds >= early_stop_min_evals
+                and no_improve_rounds >= early_stop_patience
+            ):
+                print(
+                    f"Early stopping triggered at episode {episode+1} "
+                    f"(no improvement for {no_improve_rounds} eval rounds)."
+                )
+                stop_training = True
+
+        if stop_training:
+            break
     
     print("\nTraining complete!")
     
@@ -567,6 +633,11 @@ def train(
         os.makedirs("artifacts", exist_ok=True)
         torch.save(agent.q_net.state_dict(), "artifacts/dqn_q_net.pth")
         print(f"  Model saved to artifacts/dqn_q_net.pth")
+        if best_train_episode >= 0:
+            print(
+                f"  Best model saved to {best_model_path} "
+                f"(train episode {best_train_episode + 1})"
+            )
     
     if output_csv:
         os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
@@ -606,6 +677,10 @@ if __name__ == "__main__":
     parser.add_argument("--insulin-penalty-coeff", type=float, default=0.1)
     parser.add_argument("--sweep-insulin-penalty", action="store_true")
     parser.add_argument("--sweep-coeffs", type=str, default="0.1,0.3,0.5")
+    parser.add_argument("--early-stop-patience", type=int, default=None)
+    parser.add_argument("--early-stop-min-evals", type=int, default=4)
+    parser.add_argument("--safety-hypo-max", type=float, default=3.0)
+    parser.add_argument("--safety-severe-max", type=float, default=2.0)
     parser.add_argument("--no-csv", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     
@@ -638,6 +713,10 @@ if __name__ == "__main__":
                 eval_episodes=args.eval_episodes,
                 output_csv=run_out,
                 insulin_penalty_coeff=coeff,
+                early_stop_patience=args.early_stop_patience,
+                early_stop_min_evals=args.early_stop_min_evals,
+                safety_hypo_max=args.safety_hypo_max,
+                safety_severe_max=args.safety_severe_max,
                 verbose=args.verbose,
             )
             sweep_results.append({"coeff": coeff, "summary": run_summary})
@@ -659,5 +738,9 @@ if __name__ == "__main__":
             eval_episodes=args.eval_episodes,
             output_csv=output_csv,
             insulin_penalty_coeff=args.insulin_penalty_coeff,
+            early_stop_patience=args.early_stop_patience,
+            early_stop_min_evals=args.early_stop_min_evals,
+            safety_hypo_max=args.safety_hypo_max,
+            safety_severe_max=args.safety_severe_max,
             verbose=args.verbose,
         )
